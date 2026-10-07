@@ -1,32 +1,30 @@
 const express = require("express");
 
-const TARGET_URL = process.env.TARGET_URL || "http://192.168.1.1/tagbatch";
-const HMI_URL = process.env.HMI_URL || "http://192.168.1.1/";
-const ORIGIN = process.env.ORIGIN || "http://192.168.1.1";
-const REFERER = process.env.REFERER || "http://192.168.1.1/";
+// Prefix every console.log/console.error call with an ISO timestamp
+const withTimestamp =
+  (fn) =>
+  (...args) =>
+    fn(`[${new Date().toISOString()}]`, ...args);
+console.log = withTimestamp(console.log.bind(console));
+console.error = withTimestamp(console.error.bind(console));
 
-// Fallback only if browser SID retrieval fails
-const FALLBACK_SID_COOKIE = process.env.SID_COOKIE || "SID=e8f2963e28";
+// The URL of the web page
+const HMI_URL = process.env.HMI_URL || "http://192.168.1.1";
 
-let SID_COOKIE = FALLBACK_SID_COOKIE;
+// Fallback only if SID retrieval fails
+let SID = process.env.SID || "e8f2963e28";
 
-// The HMI caps concurrent clients; when full it returns 503. Retry with backoff
-// instead of failing, since slots free up as other clients disconnect.
-const MAX_HMI_RETRIES = Number(process.env.MAX_HMI_RETRIES || 500);
-const HMI_RETRY_DELAY_MS = Number(process.env.HMI_RETRY_DELAY_MS || 2000);
+// The max retries in a request to reset the SID when it's invalid (defaults to 1 per API request)
+const MAX_REFRESH_SID_RETRIES = Number(
+  process.env.MAX_REFRESH_SID_RETRIES || 1,
+);
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// In milliseconds (ms)
+const RETRY_REFRESH_SID_RETRY_DELAY = Number(
+  process.env.RETRY_REFRESH_SID_RETRY_DELAY || 500,
+);
 
-// The HMI returns 503 specifically when it is at its client cap. Any other
-// non-200 is a different problem, so only 503 gets the "max clients" message.
-function hmiStatusError(status) {
-  return status === 503
-    ? new Error(
-        "Service Unavailable - Maximum number of active clients reached",
-      )
-    : new Error(`HMI did not return 200 (got ${status})`);
-}
-
+// The tags sent from the HMI API (gotten from the PLC) that we can request
 const DEFAULT_TAGS = [
   "HMI_LineName",
   "IN_NcAutoRunning",
@@ -38,37 +36,77 @@ const DEFAULT_TAGS = [
   "OP_ApoStatus",
 ];
 
-/**
- * Fetch the HMI root page and read the SID from its Set-Cookie header.
- * Retries with backoff while the HMI is at its client cap (503).
- */
-async function refreshSid() {
-  console.log("Refreshing Amada SID...");
+// Custom tags that will be sent by us (our API)
+const PLC_LOST = "PLC_LOST";
+const VALID_DATA = "VALID_DATA";
 
-  for (let attempt = 1; attempt <= MAX_HMI_RETRIES; attempt++) {
+// Actors
+// - PLC: The PLC connected to the Amada
+// - HMI API: The HMI (Human-Machine Interface) API used by the webpage, this is where the data shown on the web page comes from
+
+// Builds the error response. The HMI API returns 503 specifically when it
+// loses its connection to the PLC (responding with "max clients reached"),
+// so a 503 error response will contain PLC_LOST=true in addition to
+// VALID_DATA=false tags. Any other status code is a different issue and will return only the VALID_DATA=false tag
+const buildErrorResponse = (statusCode) => {
+  return statusCode === 503
+    ? {
+        tags: [
+          {
+            name: PLC_LOST,
+            value: 1,
+          },
+          {
+            name: VALID_DATA,
+            value: 0,
+          },
+        ],
+      }
+    : {
+        // Regular (non-PLC lost) error (any other statusCode)
+        tags: [
+          {
+            name: VALID_DATA,
+            value: 0,
+          },
+        ],
+      };
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Refresh SID by fetching the HMI web page and reading the SID from its cookies
+const refreshSid = async () => {
+  console.log("- Refreshing SID...");
+
+  for (let attempt = 1; attempt <= MAX_REFRESH_SID_RETRIES; attempt++) {
     const response = await fetch(HMI_URL, { redirect: "manual" });
-    const status = response.status;
+    const statusCode = response.status;
     console.log(
-      `HMI GET attempt ${attempt}/${MAX_HMI_RETRIES} status:`,
-      status,
+      `-- Refreshing SID, attempt ${attempt}/${MAX_REFRESH_SID_RETRIES}. Status code:`,
+      statusCode,
     );
 
-    if (status === 503 && attempt < MAX_HMI_RETRIES) {
-      await sleep(HMI_RETRY_DELAY_MS);
+    // Keep retrying until we have a valid SID or we have reached the MAX_REFRESH_SID_RETRIES
+    if (statusCode === 503 && attempt < MAX_REFRESH_SID_RETRIES) {
+      // Uncomment this if you want delay between retries
+      // await sleep(RETRY_REFRESH_SID_RETRY_DELAY);
       continue;
     }
 
-    if (status !== 200) {
-      throw hmiStatusError(status);
+    if (statusCode !== 200) {
+      const error = new Error(`Refresh SID failed (status ${statusCode})`);
+      error.statusCode = statusCode;
+      throw error;
     }
 
-    // Prefer getSetCookie() (keeps cookies split); fall back to the combined header.
-    const setCookies =
+    // Support for older Node.js versions to retrieve cookies
+    const cookies =
       typeof response.headers.getSetCookie === "function"
         ? response.headers.getSetCookie()
         : [response.headers.get("set-cookie")].filter(Boolean);
 
-    const match = setCookies
+    const match = cookies
       .map((cookie) => cookie.match(/SID=([^;]+)/i))
       .find(Boolean);
 
@@ -76,51 +114,45 @@ async function refreshSid() {
       throw new Error("SID cookie not found in HMI Set-Cookie header");
     }
 
-    SID_COOKIE = `SID=${match[1]}`;
-    console.log("Using SID:", SID_COOKIE);
+    // Set the SID here
+    SID = match[1];
+    console.log("Using SID:", SID);
     return;
   }
-}
+};
 
-/**
- * Forwards tags to the HMI tagbatch endpoint. On a 503 the HMI is at its client
- * cap (not a stale SID), so we wait for a free slot and retry rather than
- * refreshing. Any other non-200 is thrown so the caller can refresh the SID.
- */
 async function fetchTags(tags) {
-  for (let attempt = 1; ; attempt++) {
-    const response = await fetch(TARGET_URL, {
-      method: "POST",
-      headers: {
-        Accept: "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9",
-        Connection: "keep-alive",
-        "Content-Type": "application/json",
-        Cookie: SID_COOKIE,
-        Origin: ORIGIN,
-        Referer: REFERER,
-        "X-Requested-With": "XMLHttpRequest",
-      },
-      body: JSON.stringify({ getTags: tags }),
-    });
+  const response = await fetch(`${HMI_URL}/tagbatch`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json, text/javascript, */*; q=0.01",
+      "Accept-Language": "en-US,en;q=0.9",
+      Connection: "keep-alive",
+      "Content-Type": "application/json",
+      Cookie: `SID=${SID}`,
+      Origin: HMI_URL,
+      Referer: HMI_URL,
+      "X-Requested-With": "XMLHttpRequest",
+    },
+    body: JSON.stringify({ getTags: tags }),
+  });
 
-    if (response.status === 200) {
-      return response.json();
-    }
-
-    if (response.status === 503 && attempt < MAX_HMI_RETRIES) {
-      console.warn(
-        `HMI busy (503), retry ${attempt}/${MAX_HMI_RETRIES} in ${HMI_RETRY_DELAY_MS}ms`,
-      );
-      await sleep(HMI_RETRY_DELAY_MS);
-      continue;
-    }
-
-    // Any other non-200 (or an exhausted 503 when MAX_HMI_RETRIES is reached) is a failure the caller handles
-    const error = hmiStatusError(response.status);
-    error.status = response.status;
+  if (response.status !== 200) {
+    const error = new Error(
+      `API fetch tags failed (status ${response.status})`,
+    );
+    error.statusCode = response.status;
     throw error;
   }
+
+  // Return a valid response only on status code 200
+  const result = await response.json();
+  // Add the VALID_DATA custom tag
+  result["tags"].push({
+    name: VALID_DATA,
+    value: 1,
+  });
+  return result;
 }
 
 function createApp() {
@@ -139,29 +171,21 @@ function createApp() {
       const result = await fetchTags(tags);
       res.json(result);
     } catch (error) {
-      console.error(error.message);
+      console.error(`Error: ${error.message} (status: ${error.statusCode})`);
       try {
-        // A non-503 failure may mean a stale SID — refresh it and retry once
+        // Refresh SID at least once (or whatever is set on MAX_REFRESH_SID_RETRIES) when there's an error thrown from the fetchTags API
         await refreshSid();
         const result = await fetchTags(tags);
         res.json(result);
-      } catch (retryError) {
-        res.status(502).json({
-          error: retryError.message,
-        });
+      } catch (finalError) {
+        // Retry also failed, send the error payload to the client
+        res.status(502).json(buildErrorResponse(finalError.statusCode));
       }
     }
   });
 
   return app;
 }
-
-module.exports = {
-  createApp,
-  fetchTags,
-  refreshSid,
-  DEFAULT_TAGS,
-};
 
 if (require.main === module) {
   const port = process.env.PORT || 3001;
@@ -173,7 +197,7 @@ if (require.main === module) {
       await refreshSid();
     } catch (err) {
       console.error("Initial SID refresh failed:", err.message);
-      console.log("Using fallback SID:", SID_COOKIE);
+      console.log("Using fallback SID:", SID);
     }
   });
 }
